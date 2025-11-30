@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+PriceTableNA.zip
+PriceTableEU.zip
+PriceTableNA.lua
+PriceTableEU.lua
+TTC_Prices.csv
