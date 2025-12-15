@@ -1,9 +1,12 @@
 use chrono::{DateTime, Datelike, Utc};
+use csv::ReaderBuilder;
+use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use reqwest::blocking::get;
 use serde::Deserialize;
 use zip::ZipArchive;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
@@ -333,8 +336,157 @@ fn process_server(region: &str, latest_csv: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> io::Result<()> {
+#[derive(Debug, Deserialize)]
+struct CsvRow {
+    item_id: String,
+    quality: String,
+    level: String,
+    #[serde(rename = "trait")]
+    trait_id: String,
+    variant: String,
+
+    avg: f64,
+    max: f64,
+    min: f64,
+    entry_count: u32,
+    amount_count: u32,
+
+    suggested_price: Option<f64>,
+    sale_avg: Option<f64>,
+    sale_entry_count: Option<u32>,
+    sale_amount_count: Option<u32>,
+}
+
+pub fn parse_items_from_csv_file(path: &str) -> Result<Vec<ItemEntry>, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mut reader = csv::Reader::from_reader(file);
+
+    let mut entries = Vec::new();
+
+    for result in reader.deserialize::<CsvRow>() {
+        let row = result?;
+
+        entries.push(ItemEntry {
+            item_id: row.item_id,
+            quality: row.quality,
+            level: row.level,
+            trait_id: row.trait_id,
+            variant: row.variant,
+            price: PriceInfo {
+                avg: row.avg,
+                max: row.max,
+                min: row.min,
+                entry_count: row.entry_count,
+                amount_count: row.amount_count,
+                suggested_price: row.suggested_price,
+                sale_avg: row.sale_avg,
+                sale_entry_count: row.sale_entry_count,
+                sale_amount_count: row.sale_amount_count,
+            },
+        });
+    }
+
+    Ok(entries)
+}
+
+pub fn total_average_market_cap(entries: &[ItemEntry]) -> u64 {
+    let total: f64 = entries
+        .iter()
+        .filter_map(|entry| {
+            let quantity = entry.price.amount_count;
+            if quantity == 0 {
+                return None;
+            }
+
+            let unit_price = entry
+                .price
+                .sale_avg
+                .unwrap_or(entry.price.avg)
+                .max(entry.price.min);
+
+            Some(unit_price * quantity as f64)
+        })
+        .sum();
+    total as u64
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemNameRow {
+    item_id: u32,
+    item_name: String,
+}
+
+pub fn load_item_names(path: &str) -> Result<HashMap<u32, String>, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(file);
+
+    let mut names = HashMap::new();
+
+    for result in reader.deserialize::<ItemNameRow>() {
+        let row = result?;
+        names.insert(row.item_id, row.item_name);
+    }
+
+    Ok(names)
+}
+
+pub fn print_top_items_by_market_cap(entries: &[ItemEntry], item_names: &HashMap<u32, String>) {
+    let mut caps: HashMap<u32, f64> = HashMap::new();
+
+    for entry in entries {
+        let quantity = entry.price.amount_count;
+        let sellers = entry.price.sale_amount_count.unwrap_or(0);
+        if quantity <= 500 && sellers < 3 {
+            continue;
+        }
+
+        let unit_price = entry
+            .price
+            .sale_avg
+            .unwrap_or(entry.price.avg)
+            .max(entry.price.min);
+
+        let market_cap = unit_price * quantity as f64;
+
+        *caps.entry(entry.item_id.parse::<u32>().unwrap()).or_insert(0.0) += market_cap;
+    }
+
+    let mut caps_vec: Vec<(u32, f64)> = caps.into_iter().collect();
+
+    caps_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    println!("{:<6} {:<20} {}", "Rank", "Market Cap", "Item");
+
+    for (rank, (item_id, cap)) in caps_vec.into_iter().take(50).enumerate() {
+        let name = item_names
+            .get(&item_id)
+            .map(String::as_str)
+            .unwrap_or("UNKNOWN");
+
+        let cap_int = cap.round() as u64;
+        let formatted_cap = cap_int.to_formatted_string(&Locale::en);
+
+        println!(
+            "{:<6} {:<20} {}",
+            rank + 1,
+            formatted_cap,
+            name
+        );
+    }
+}
+fn main() -> Result<(), Box<dyn Error>> {
     process_server("NA", "latest/na.csv")?;
     process_server("EU", "latest/eu.csv")?;
+    let na = parse_items_from_csv_file("latest/na.csv")?;
+    let eu = parse_items_from_csv_file("latest/eu.csv")?;
+    let item_lookup = load_item_names("latest/lookup.csv")?;
+    let na_mc = total_average_market_cap(&na);
+    let eu_mc = total_average_market_cap(&eu);
+    println!("\nPC NA Gold Market Cap Estimate: {} (based on available TTC data)", na_mc.to_formatted_string(&Locale::en));
+    print_top_items_by_market_cap(&na, &item_lookup);
+    println!("\nPC EU Gold Market Cap Estimate: {} (based on available TTC data)", eu_mc.to_formatted_string(&Locale::en));
+    print_top_items_by_market_cap(&eu, &item_lookup);
     Ok(())
 }
