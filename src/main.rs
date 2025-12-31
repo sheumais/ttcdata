@@ -1,8 +1,12 @@
 use chrono::{DateTime, Datelike, Utc};
+use csv::ReaderBuilder;
+use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use reqwest::blocking::get;
 use serde::Deserialize;
 use zip::ZipArchive;
+use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
@@ -119,6 +123,14 @@ fn extract_price_table(text: &str) -> String {
     panic!("Could not locate self.PriceTable={{...}} block");
 }
 
+fn extract_item_lookup_table(text: &str) -> Option<String> {
+    let re = Regex::new(r"self\.ItemLookUpTable\s*=\s*\{(?s)(?P<body>.*?)\}\s*end").unwrap();
+    if let Some(caps) = re.captures(text) {
+        return Some(caps["body"].to_string());
+    }
+    None
+}
+
 fn extract_timestamp_from_block(block: &str) -> Option<i64> {
     let re = Regex::new(r#"\[?\s*['\"]?TimeStamp['\"]?\s*\]?\s*=\s*(\d+)"#).unwrap();
         if let Some(caps) = re.captures(block) {
@@ -224,6 +236,19 @@ fn parse_ttc_lua(lua_text: &str) -> (Vec<ItemEntry>, Option<i64>) {
     (results, timestamp)
 }
 
+fn parse_item_lookup(lua_text: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    if let Some(body) = extract_item_lookup_table(lua_text) {
+        let re = Regex::new(r#"\[\s*\"([^\"]+)\"\s*\]\s*=\s*\{\s*\[\s*\d+\s*\]\s*=\s*(\d+)\s*,?\s*\}"#).unwrap();
+        for cap in re.captures_iter(&body) {
+            let name = cap[1].to_string();
+            let id = cap[2].to_string();
+            map.insert(id, name);
+        }
+    }
+    map
+}
+
 fn write_entries_to_csv_manual(entries: &[ItemEntry], path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() { fs::create_dir_all(parent)?; }
     let mut file = File::create(path)?;
@@ -237,40 +262,72 @@ fn write_entries_to_csv_manual(entries: &[ItemEntry], path: &str) -> std::io::Re
     Ok(())
 }
 
+fn write_lookup_table(lookup_map: &BTreeMap<String, String>, path: &str) -> std::io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() { fs::create_dir_all(parent)?; }
+    let mut file = File::create(path)?;
+    let header = ["item_id", "item_name"].join(",");
+    writeln!(file, "{}", header)?;
+    for (id, name) in lookup_map.iter() {
+        let quoted_name = format!("\"{}\"", name);
+        let parts = vec![ id, &quoted_name];
+        let row = parts.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(",");
+        writeln!(file, "{}", row)?;
+    }
+    Ok(())
+}
 
 fn process_server(region: &str, latest_csv: &str) -> io::Result<()> {
-    let (url, zip_path, lua_filename, csv_prefix) = match region {
+    let (url, zip_path, lua_filename, lookup_filename, csv_prefix) = match region {
         "NA" => (
             "https://us.tamrieltradecentre.com/download/PriceTable",
             "PriceTableNA.zip",
             "PriceTableNA.lua",
+            "ItemLookUpTable_EN.lua",
             "na",
         ),
         "EU" => (
             "https://eu.tamrieltradecentre.com/download/PriceTable",
             "PriceTableEU.zip",
             "PriceTableEU.lua",
+            "ItemLookUpTable_EN.lua",
             "eu",
         ),
         _ => panic!("Unknown region: {}", region),
     };
 
     let lua_output = lua_filename;
+    let lookup_output = lookup_filename;
     download_zip(url, zip_path)?;
     extract_lua_from_zip(zip_path, lua_filename, lua_output)?;
-    
+
+    let mut lookup_map: BTreeMap<String, String> = BTreeMap::new();
+
+    if let Ok(()) = extract_lua_from_zip(zip_path, lookup_filename, lookup_output) {
+        let lookup_text = fs::read_to_string(lookup_output).expect("Could not read lookup Lua file");
+        lookup_map = parse_item_lookup(&lookup_text);
+        if Path::new(lookup_output).exists() { 
+            fs::remove_file(lookup_output)?; 
+        }
+    } else {
+        println!("Warning: {} not found in ZIP archive; item names will be empty", lookup_filename);
+    }
     let lua_text = fs::read_to_string(lua_output).expect("Could not read Lua file");
     let (entries, timestamp_opt) = parse_ttc_lua(&lua_text);
     println!("Parsed {} price entries for {}.", entries.len(), region);
 
-    let timestamp = timestamp_opt.unwrap_or_else(|| Utc::now().timestamp());
+    let timestamp = timestamp_opt.unwrap_or_else(|| Utc::now().timestamp()); 
     let ndt = DateTime::from_timestamp(timestamp, 0).unwrap();
     let folder = format!("{:04}/{:02}/{:02}", ndt.year(), ndt.month(), ndt.day());
     fs::create_dir_all(&folder)?;
 
-    let csv_path = format!("{}/{}_{}.csv", folder, csv_prefix, timestamp);
+    let csv_path = format!("{}/{}.csv", folder, csv_prefix);
     write_entries_to_csv_manual(&entries, &csv_path)?;
     write_entries_to_csv_manual(&entries, latest_csv)?;
+    let lookup_path = format!("{}/lookup.csv", folder);
+    let latest_lookup_path = format!("latest/lookup.csv");
+    write_lookup_table(&lookup_map, &lookup_path)?;
+    write_lookup_table(&lookup_map, &latest_lookup_path)?;
+
     println!("CSV written to {} and latest CSV updated at {}", csv_path, latest_csv);
 
     if Path::new(zip_path).exists() { fs::remove_file(zip_path)?; }
@@ -279,8 +336,157 @@ fn process_server(region: &str, latest_csv: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> io::Result<()> {
-    process_server("NA", "latest_na.csv")?;
-    process_server("EU", "latest_eu.csv")?;
+#[derive(Debug, Deserialize)]
+struct CsvRow {
+    item_id: String,
+    quality: String,
+    level: String,
+    #[serde(rename = "trait")]
+    trait_id: String,
+    variant: String,
+
+    avg: f64,
+    max: f64,
+    min: f64,
+    entry_count: u32,
+    amount_count: u32,
+
+    suggested_price: Option<f64>,
+    sale_avg: Option<f64>,
+    sale_entry_count: Option<u32>,
+    sale_amount_count: Option<u32>,
+}
+
+pub fn parse_items_from_csv_file(path: &str) -> Result<Vec<ItemEntry>, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mut reader = csv::Reader::from_reader(file);
+
+    let mut entries = Vec::new();
+
+    for result in reader.deserialize::<CsvRow>() {
+        let row = result?;
+
+        entries.push(ItemEntry {
+            item_id: row.item_id,
+            quality: row.quality,
+            level: row.level,
+            trait_id: row.trait_id,
+            variant: row.variant,
+            price: PriceInfo {
+                avg: row.avg,
+                max: row.max,
+                min: row.min,
+                entry_count: row.entry_count,
+                amount_count: row.amount_count,
+                suggested_price: row.suggested_price,
+                sale_avg: row.sale_avg,
+                sale_entry_count: row.sale_entry_count,
+                sale_amount_count: row.sale_amount_count,
+            },
+        });
+    }
+
+    Ok(entries)
+}
+
+pub fn total_average_market_cap(entries: &[ItemEntry]) -> u64 {
+    let total: f64 = entries
+        .iter()
+        .filter_map(|entry| {
+            let quantity = entry.price.amount_count;
+            if quantity == 0 {
+                return None;
+            }
+
+            let unit_price = entry
+                .price
+                .sale_avg
+                .unwrap_or(entry.price.avg)
+                .max(entry.price.min);
+
+            Some(unit_price * quantity as f64)
+        })
+        .sum();
+    total as u64
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemNameRow {
+    item_id: u32,
+    item_name: String,
+}
+
+pub fn load_item_names(path: &str) -> Result<HashMap<u32, String>, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(file);
+
+    let mut names = HashMap::new();
+
+    for result in reader.deserialize::<ItemNameRow>() {
+        let row = result?;
+        names.insert(row.item_id, row.item_name);
+    }
+
+    Ok(names)
+}
+
+pub fn print_top_items_by_market_cap(entries: &[ItemEntry], item_names: &HashMap<u32, String>) {
+    let mut caps: HashMap<u32, f64> = HashMap::new();
+
+    for entry in entries {
+        let quantity = entry.price.amount_count;
+        let sellers = entry.price.sale_amount_count.unwrap_or(0);
+        if quantity <= 500 && sellers < 3 {
+            continue;
+        }
+
+        let unit_price = entry
+            .price
+            .sale_avg
+            .unwrap_or(entry.price.avg)
+            .max(entry.price.min);
+
+        let market_cap = unit_price * quantity as f64;
+
+        *caps.entry(entry.item_id.parse::<u32>().unwrap()).or_insert(0.0) += market_cap;
+    }
+
+    let mut caps_vec: Vec<(u32, f64)> = caps.into_iter().collect();
+
+    caps_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    println!("{:<6} {:<20} {}", "Rank", "Market Cap", "Item");
+
+    for (rank, (item_id, cap)) in caps_vec.into_iter().take(50).enumerate() {
+        let name = item_names
+            .get(&item_id)
+            .map(String::as_str)
+            .unwrap_or("UNKNOWN");
+
+        let cap_int = cap.round() as u64;
+        let formatted_cap = cap_int.to_formatted_string(&Locale::en);
+
+        println!(
+            "{:<6} {:<20} {}",
+            rank + 1,
+            formatted_cap,
+            name
+        );
+    }
+}
+fn main() -> Result<(), Box<dyn Error>> {
+    process_server("NA", "latest/na.csv")?;
+    process_server("EU", "latest/eu.csv")?;
+    let na = parse_items_from_csv_file("latest/na.csv")?;
+    let eu = parse_items_from_csv_file("latest/eu.csv")?;
+    let item_lookup = load_item_names("latest/lookup.csv")?;
+    let na_mc = total_average_market_cap(&na);
+    let eu_mc = total_average_market_cap(&eu);
+    println!("\nPC NA Gold Market Cap Estimate: {} (based on available TTC data)", na_mc.to_formatted_string(&Locale::en));
+    print_top_items_by_market_cap(&na, &item_lookup);
+    println!("\nPC EU Gold Market Cap Estimate: {} (based on available TTC data)", eu_mc.to_formatted_string(&Locale::en));
+    print_top_items_by_market_cap(&eu, &item_lookup);
     Ok(())
 }
