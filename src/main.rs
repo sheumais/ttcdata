@@ -323,12 +323,12 @@ fn process_server(region: &str, latest_csv: &str) -> io::Result<()> {
     let csv_path = format!("{}/{}.csv", folder, csv_prefix);
     write_entries_to_csv_manual(&entries, &csv_path)?;
     write_entries_to_csv_manual(&entries, latest_csv)?;
-    let lookup_path = format!("{}/lookup.csv", folder);
-    let latest_lookup_path = format!("latest/lookup.csv");
-    write_lookup_table(&lookup_map, &lookup_path)?;
-    write_lookup_table(&lookup_map, &latest_lookup_path)?;
 
-    println!("CSV written to {} and latest CSV updated at {}", csv_path, latest_csv);
+    let latest_lookup_path = "latest/lookup.csv";
+    if lookup_has_changed(&lookup_map, latest_lookup_path) {
+        let dated_lookup_path = format!("{}/lookup.csv", folder);
+        write_lookup_table(&lookup_map, &dated_lookup_path)?;
+    }
 
     if Path::new(zip_path).exists() { fs::remove_file(zip_path)?; }
     if Path::new(lua_output).exists() { fs::remove_file(lua_output)?; }
@@ -476,6 +476,23 @@ pub fn print_top_items_by_market_cap(entries: &[ItemEntry], item_names: &HashMap
         );
     }
 }
+
+fn lookup_has_changed(new_map: &BTreeMap<String, String>, existing_path: &str) -> bool {
+    let Ok(existing) = load_item_names(existing_path) else {
+        return true;
+    };
+    if existing.len() != new_map.len() {
+        return true;
+    }
+    for (id, name) in new_map {
+        match existing.get(&id.parse::<u32>().unwrap_or(0)) {
+            Some(existing_name) if existing_name == name => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     process_server("NA", "latest/na.csv")?;
     process_server("EU", "latest/eu.csv")?;
