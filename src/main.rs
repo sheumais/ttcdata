@@ -8,7 +8,7 @@ use zip::ZipArchive;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +262,45 @@ fn write_entries_to_csv_manual(entries: &[ItemEntry], path: &str) -> std::io::Re
     Ok(())
 }
 
+fn write_entries_to_csv_zst(entries: &[ItemEntry], path: &str) -> io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path)?;
+    let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
+
+    let header = [
+        "item_id", "quality", "level", "trait", "variant",
+        "avg", "max", "min", "entry_count", "amount_count",
+        "suggested_price", "sale_avg", "sale_entry_count", "sale_amount_count",
+    ]
+    .join(",");
+    writeln!(encoder, "{}", header)?;
+
+    for e in entries {
+        let parts = vec![
+            e.item_id.clone(),
+            e.quality.clone(),
+            e.level.clone(),
+            e.trait_id.clone(),
+            e.variant.clone(),
+            e.price.avg.to_string(),
+            e.price.max.to_string(),
+            e.price.min.to_string(),
+            e.price.entry_count.to_string(),
+            e.price.amount_count.to_string(),
+            e.price.suggested_price.map_or("".to_string(), |v| v.to_string()),
+            e.price.sale_avg.map_or("".to_string(), |v| v.to_string()),
+            e.price.sale_entry_count.map_or("".to_string(), |v| v.to_string()),
+            e.price.sale_amount_count.map_or("".to_string(), |v| v.to_string()),
+        ];
+        writeln!(encoder, "{}", parts.join(","))?;
+    }
+
+    encoder.finish()?;
+    Ok(())
+}
+
 fn write_lookup_table(lookup_map: &BTreeMap<String, String>, path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() { fs::create_dir_all(parent)?; }
     let mut file = File::create(path)?;
@@ -273,6 +312,22 @@ fn write_lookup_table(lookup_map: &BTreeMap<String, String>, path: &str) -> std:
         let row = parts.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(",");
         writeln!(file, "{}", row)?;
     }
+    Ok(())
+}
+
+fn write_lookup_table_zst(lookup_map: &BTreeMap<String, String>, path: &str) -> io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path)?;
+    let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
+
+    writeln!(encoder, "item_id,item_name")?;
+    for (id, name) in lookup_map.iter() {
+        writeln!(encoder, "{},\"{}\"", id, name)?;
+    }
+
+    encoder.finish()?;
     Ok(())
 }
 
@@ -320,14 +375,15 @@ fn process_server(region: &str, latest_csv: &str) -> io::Result<()> {
     let folder = format!("{:04}/{:02}/{:02}", ndt.year(), ndt.month(), ndt.day());
     fs::create_dir_all(&folder)?;
 
-    let csv_path = format!("{}/{}.csv", folder, csv_prefix);
-    write_entries_to_csv_manual(&entries, &csv_path)?;
+    let csv_path = format!("{}/{}.csv.zst", folder, csv_prefix);
+    write_entries_to_csv_zst(&entries, &csv_path)?;
     write_entries_to_csv_manual(&entries, latest_csv)?;
 
     let latest_lookup_path = "latest/lookup.csv";
     if lookup_has_changed(&lookup_map, latest_lookup_path) {
         let dated_lookup_path = format!("{}/lookup.csv", folder);
-        write_lookup_table(&lookup_map, &dated_lookup_path)?;
+        write_lookup_table_zst(&lookup_map, &dated_lookup_path)?;
+        write_lookup_table(&lookup_map, latest_lookup_path)?;
     }
 
     if Path::new(zip_path).exists() { fs::remove_file(zip_path)?; }
