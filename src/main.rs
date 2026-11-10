@@ -379,12 +379,7 @@ fn process_server(region: &str, latest_csv: &str) -> io::Result<()> {
     write_entries_to_csv_zst(&entries, &csv_path)?;
     write_entries_to_csv_manual(&entries, latest_csv)?;
 
-    let latest_lookup_path = "latest/lookup.csv";
-    if lookup_has_changed(&lookup_map, latest_lookup_path) {
-        let dated_lookup_path = format!("{}/lookup.csv", folder);
-        write_lookup_table_zst(&lookup_map, &dated_lookup_path)?;
-        write_lookup_table(&lookup_map, latest_lookup_path)?;
-    }
+    update_lookup_master(&lookup_map, &folder)?;
 
     if Path::new(zip_path).exists() { fs::remove_file(zip_path)?; }
     if Path::new(lua_output).exists() { fs::remove_file(lua_output)?; }
@@ -445,25 +440,19 @@ pub fn parse_items_from_csv_file(path: &str) -> Result<Vec<ItemEntry>, Box<dyn E
     Ok(entries)
 }
 
-pub fn total_average_market_cap(entries: &[ItemEntry]) -> u64 {
-    let total: f64 = entries
+fn entry_gold_turnover(entry: &ItemEntry) -> Option<(f64, u64)> {
+    let sold = entry.price.sale_amount_count.filter(|&n| n > 0)?;
+    let avg = entry.price.sale_avg?;
+    Some((avg * sold as f64, sold as u64))
+}
+
+pub fn total_gold_turnover(entries: &[ItemEntry]) -> u64 {
+    entries
         .iter()
-        .filter_map(|entry| {
-            let quantity = entry.price.amount_count;
-            if quantity == 0 {
-                return None;
-            }
-
-            let unit_price = entry
-                .price
-                .sale_avg
-                .unwrap_or(entry.price.avg)
-                .max(entry.price.min);
-
-            Some(unit_price * quantity as f64)
-        })
-        .sum();
-    total as u64
+        .filter_map(entry_gold_turnover)
+        .map(|(gold, _)| gold)
+        .sum::<f64>()
+        .round() as u64
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,65 +477,31 @@ pub fn load_item_names(path: &str) -> Result<HashMap<u32, String>, Box<dyn Error
     Ok(names)
 }
 
-pub fn print_top_items_by_market_cap(entries: &[ItemEntry], item_names: &HashMap<u32, String>) {
-    let mut caps: HashMap<u32, f64> = HashMap::new();
-
+pub fn print_top_items_by_gold_turnover(entries: &[ItemEntry], item_names: &HashMap<u32, String>) {
+    let mut totals: HashMap<u32, (f64, u64)> = HashMap::new();
     for entry in entries {
-        let quantity = entry.price.amount_count;
-        let sellers = entry.price.sale_amount_count.unwrap_or(0);
-        if quantity <= 500 && sellers < 3 {
-            continue;
+        let Some((gold, units)) = entry_gold_turnover(entry) else { continue };
+        if let Ok(id) = entry.item_id.parse::<u32>() {
+            let t = totals.entry(id).or_insert((0.0, 0));
+            t.0 += gold;
+            t.1 += units;
         }
-
-        let unit_price = entry
-            .price
-            .sale_avg
-            .unwrap_or(entry.price.avg)
-            .max(entry.price.min);
-
-        let market_cap = unit_price * quantity as f64;
-
-        *caps.entry(entry.item_id.parse::<u32>().unwrap()).or_insert(0.0) += market_cap;
     }
 
-    let mut caps_vec: Vec<(u32, f64)> = caps.into_iter().collect();
+    let mut ranked: Vec<(u32, (f64, u64))> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then(a.0.cmp(&b.0)));
 
-    caps_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-    println!("{:<6} {:<20} {}", "Rank", "Market Cap", "Item");
-
-    for (rank, (item_id, cap)) in caps_vec.into_iter().take(50).enumerate() {
-        let name = item_names
-            .get(&item_id)
-            .map(String::as_str)
-            .unwrap_or("UNKNOWN");
-
-        let cap_int = cap.round() as u64;
-        let formatted_cap = cap_int.to_formatted_string(&Locale::en);
-
+    println!("{:<6} {:<18} {:<12} {}", "Rank", "Gold Turnover", "Units Sold", "Item");
+    for (rank, (item_id, (gold, units))) in ranked.into_iter().take(50).enumerate() {
+        let name = item_names.get(&item_id).map(String::as_str).unwrap_or("UNKNOWN");
         println!(
-            "{:<6} {:<20} {}",
+            "{:<6} {:<18} {:<12} {}",
             rank + 1,
-            formatted_cap,
+            (gold.round() as u64).to_formatted_string(&Locale::en),
+            units.to_formatted_string(&Locale::en),
             name
         );
     }
-}
-
-fn lookup_has_changed(new_map: &BTreeMap<String, String>, existing_path: &str) -> bool {
-    let Ok(existing) = load_item_names(existing_path) else {
-        return true;
-    };
-    if existing.len() != new_map.len() {
-        return true;
-    }
-    for (id, name) in new_map {
-        match existing.get(&id.parse::<u32>().unwrap_or(0)) {
-            Some(existing_name) if existing_name == name => {}
-            _ => return true,
-        }
-    }
-    false
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -554,12 +509,148 @@ fn main() -> Result<(), Box<dyn Error>> {
     process_server("EU", "latest/eu.csv")?;
     let na = parse_items_from_csv_file("latest/na.csv")?;
     let eu = parse_items_from_csv_file("latest/eu.csv")?;
-    let item_lookup = load_item_names("latest/lookup.csv")?;
-    let na_mc = total_average_market_cap(&na);
-    let eu_mc = total_average_market_cap(&eu);
-    println!("\nPC NA Gold Market Cap Estimate: {} (based on available TTC data)", na_mc.to_formatted_string(&Locale::en));
-    print_top_items_by_market_cap(&na, &item_lookup);
-    println!("\nPC EU Gold Market Cap Estimate: {} (based on available TTC data)", eu_mc.to_formatted_string(&Locale::en));
-    print_top_items_by_market_cap(&eu, &item_lookup);
+    let item_lookup = load_item_names(MASTER_LOOKUP_PATH)?;
+    let na_gold = total_gold_turnover(&na);
+    let eu_gold = total_gold_turnover(&eu);
+    println!("\nPC NA Gold Turnover: {} (based on available TTC sales data)", na_gold.to_formatted_string(&Locale::en));
+    print_top_items_by_gold_turnover(&na, &item_lookup);
+    println!("\nPC EU Gold Turnover: {} (based on available TTC sales data)", eu_gold.to_formatted_string(&Locale::en));
+    print_top_items_by_gold_turnover(&eu, &item_lookup);
+    Ok(())
+}
+
+const MASTER_LOOKUP_PATH: &str = "latest/lookup.csv";
+const NAME_HISTORY_PATH: &str = "latest/lookup_name_history.csv";
+const MAX_RENAMES_LOGGED: usize = 20;
+
+type NameHistory = BTreeMap<(String, String), (String, String)>;
+
+fn load_lookup_map(path: &str) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let mut map = BTreeMap::new();
+    if !Path::new(path).exists() {
+        return Ok(map);
+    }
+    let mut reader = ReaderBuilder::new().has_headers(true).from_path(path)?;
+    for rec in reader.records() {
+        let rec = rec?;
+        let (Some(id), Some(name)) = (rec.get(0), rec.get(1)) else {
+            return Err(format!("{}: row with fewer than 2 fields", path).into());
+        };
+        map.insert(id.trim().to_string(), name.to_string());
+    }
+    Ok(map)
+}
+
+fn load_name_history(path: &str) -> Result<NameHistory, Box<dyn Error>> {
+    let mut history = NameHistory::new();
+    if !Path::new(path).exists() {
+        return Ok(history);
+    }
+    let mut reader = ReaderBuilder::new().has_headers(true).from_path(path)?;
+    for rec in reader.records() {
+        let rec = rec?;
+        if rec.len() != 4 {
+            return Err(format!("{}: expected 4 fields, got {}", path, rec.len()).into());
+        }
+        history.insert(
+            (rec[0].to_string(), rec[1].to_string()),
+            (rec[2].to_string(), rec[3].to_string()),
+        );
+    }
+    Ok(history)
+}
+
+fn write_name_history(history: &NameHistory, path: &str) -> Result<(), Box<dyn Error>> {
+    let mut w = csv::Writer::from_path(path)?;
+    w.write_record(["item_id", "item_name", "first_seen", "last_seen"])?;
+    for ((id, name), (first, last)) in history {
+        w.write_record([id.as_str(), name.as_str(), first.as_str(), last.as_str()])?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+fn update_lookup_master(new_map: &BTreeMap<String, String>, folder: &str) -> io::Result<()> {
+    let as_io = |e: Box<dyn Error>| io::Error::new(io::ErrorKind::Other, e.to_string());
+
+    if new_map.is_empty() {
+        println!("Warning: source lookup is empty; master lookup left untouched");
+        return Ok(());
+    }
+    let date = folder.replace('/', "-");
+
+    let mut master = load_lookup_map(MASTER_LOOKUP_PATH).map_err(as_io)?;
+    let mut history = load_name_history(NAME_HISTORY_PATH).map_err(as_io)?;
+
+    for (id, name) in new_map {
+        let e = history
+            .entry((id.clone(), name.clone()))
+            .or_insert((date.clone(), date.clone()));
+        if date < e.0 {
+            e.0 = date.clone();
+        }
+        if date > e.1 {
+            e.1 = date.clone();
+        }
+    }
+
+    let mut added: Vec<String> = Vec::new();
+    let mut renamed: Vec<(String, String, String)> = Vec::new();
+    for (id, name) in new_map {
+        match master.get(id) {
+            None => added.push(id.clone()),
+            Some(old) if old != name => renamed.push((id.clone(), old.clone(), name.clone())),
+            _ => {}
+        }
+    }
+    let retained = master.keys().filter(|k| !new_map.contains_key(*k)).count();
+
+    for id in &added {
+        master.insert(id.clone(), new_map[id].clone());
+    }
+    for (id, _, new_name) in &renamed {
+        master.insert(id.clone(), new_name.clone());
+    }
+
+    if !added.is_empty() || !renamed.is_empty() {
+        println!(
+            "Lookup master: +{} new id(s), {} renamed (snapshot {})",
+            added.len(),
+            renamed.len(),
+            date
+        );
+        for (id, old, new_name) in renamed.iter().take(MAX_RENAMES_LOGGED) {
+            println!("  RENAMED {}: {:?} -> {:?}", id, old, new_name);
+        }
+        if renamed.len() > MAX_RENAMES_LOGGED {
+            println!("  ... {} more renames (see {})", renamed.len() - MAX_RENAMES_LOGGED, NAME_HISTORY_PATH);
+        }
+
+        let mut by_name: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+        for (id, name) in &master {
+            by_name.entry(name.trim().to_lowercase()).or_default().push(id);
+        }
+        let changed: Vec<&String> = added.iter().chain(renamed.iter().map(|r| &r.0)).collect();
+        for id in changed {
+            if let Some(ids) = by_name.get(&master[id].trim().to_lowercase()) {
+                if ids.len() > 1 {
+                    let list: Vec<&str> = ids.iter().map(|i| i.as_str()).collect();
+                    println!(
+                        "  WARNING: name {:?} is now shared by ids {} - possible id reuse",
+                        master[id],
+                        list.join(", ")
+                    );
+                }
+            }
+        }
+
+        write_lookup_table(&master, MASTER_LOOKUP_PATH)?;
+        write_lookup_table_zst(&master, &format!("{}/lookup.csv", folder))?;
+    }
+    if retained > 0 {
+        println!("Lookup master: {} id(s) no longer in the source lookup (kept)", retained);
+    }
+
+    write_name_history(&history, NAME_HISTORY_PATH).map_err(as_io)?;
     Ok(())
 }
